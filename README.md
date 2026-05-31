@@ -1,5 +1,7 @@
 # Composite Camera
 
+> **Repo:** https://github.com/fivelidz/composite-camera (private) · current build **v0.4**
+
 A modern Android camera app with two photography pipelines that, as far as we can tell, no other
 mobile app combines in one place:
 
