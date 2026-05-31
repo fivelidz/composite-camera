@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- camera body -->
+    <path
+        android:fillColor="#E5E5E5"
+        android:pathData="M30,40 L78,40 L78,76 L30,76 Z" />
+    <!-- top flap with shutter -->
+    <path
+        android:fillColor="#E5E5E5"
+        android:pathData="M42,32 L66,32 L70,40 L38,40 Z" />
+    <!-- lens outer -->
+    <path
+        android:fillColor="#222222"
+        android:pathData="M54,58 m-15,0 a15,15 0 1,0 30,0 a15,15 0 1,0 -30,0" />
+    <!-- lens inner highlight -->
+    <path
+        android:fillColor="#5FB0FF"
+        android:pathData="M54,58 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0" />
+    <!-- focus dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,58 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+</vector>

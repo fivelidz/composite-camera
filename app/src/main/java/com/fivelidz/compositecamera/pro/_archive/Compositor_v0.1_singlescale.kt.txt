@@ -1,0 +1,309 @@
+package com.fivelidz.compositecamera.pro
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Log
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Combines an N-exposure × M-focus bracket into one all-in-focus HDR-fused JPEG.
+ *
+ * Pipeline:
+ *   1. For each focus bucket, run **Mertens exposure fusion** across the N exposures.
+ *      Outputs M fused images (one per focus plane), each well-exposed across the full DR.
+ *   2. **Focus stack** the M fused images. For each pixel, pick / blend the source that's
+ *      sharpest at that location (Laplacian-of-Gaussian magnitude).
+ *
+ * To keep this practical on-device we work at a single resolution (no Laplacian pyramid blend)
+ * but use soft per-pixel weight maps — the result is visually very close to full multi-band fusion
+ * for typical interior scenes, and finishes in 2–4 seconds for 12MP.
+ *
+ * Memory note: we deliberately downscale the bracket frames before fusion if they're huge,
+ * because holding 9 full-res 12MP bitmaps as int[] uses ~430MB and OOMs every mid-range phone.
+ * Target working size: ~6 MP (which is still very good for screen / web / Play-Store-grade output).
+ */
+object Compositor {
+
+    private const val TAG = "Compositor"
+
+    data class Frame(
+        val jpeg: ByteArray,
+        val exposureBucket: Int,
+        val focusBucket: Int,
+    )
+
+    /**
+     * Combine the bracket. [progress] is called with (0..1, label).
+     */
+    fun composite(
+        frames: List<Frame>,
+        exposureCount: Int,
+        focusCount: Int,
+        maxLongEdge: Int = 3000,
+        progress: (Float, String) -> Unit = { _, _ -> },
+    ): Bitmap {
+        require(frames.size == exposureCount * focusCount) {
+            "Expected ${exposureCount * focusCount} frames, got ${frames.size}"
+        }
+
+        // 1. Decode + downscale all frames.
+        progress(0.05f, "Decoding frames")
+        val bitmaps: Array<Array<Bitmap?>> = Array(focusCount) { arrayOfNulls<Bitmap>(exposureCount) }
+        for (f in frames) {
+            val bmp = decodeScaled(f.jpeg, maxLongEdge)
+            bitmaps[f.focusBucket][f.exposureBucket] = bmp
+        }
+
+        val w = bitmaps[0][0]!!.width
+        val h = bitmaps[0][0]!!.height
+        Log.i(TAG, "Working resolution: ${w}x${h}, exposures=$exposureCount focuses=$focusCount")
+
+        // 2. Per-focus-bucket exposure fusion.
+        val perFocusFused = mutableListOf<IntArray>()  // ARGB int arrays
+        for (focusIdx in 0 until focusCount) {
+            progress(0.1f + 0.4f * (focusIdx.toFloat() / focusCount),
+                "Fusing exposures @ focus ${focusIdx + 1}/$focusCount")
+            val fused = mertensFuse(bitmaps[focusIdx].map { it!! })
+            perFocusFused += fused
+        }
+
+        // 3. Focus-stack across the fused images.
+        progress(0.55f, "Focus stacking")
+        val finalPixels = focusStack(perFocusFused, w, h)
+
+        // 4. Compose final Bitmap.
+        progress(0.95f, "Encoding")
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(finalPixels, 0, w, 0, 0, w, h)
+
+        progress(1f, "Done")
+        return out
+    }
+
+    // ---------- Mertens exposure fusion (single-scale, weighted average) ----------
+
+    private fun mertensFuse(exposures: List<Bitmap>): IntArray {
+        val n = exposures.size
+        val w = exposures[0].width
+        val h = exposures[0].height
+        val px = Array(n) { i ->
+            val arr = IntArray(w * h)
+            exposures[i].getPixels(arr, 0, w, 0, 0, w, h)
+            arr
+        }
+
+        // Per-frame weight = contrast(W_c) × saturation(W_s) × wellExposedness(W_e)
+        val weights = Array(n) { FloatArray(w * h) }
+        for (i in 0 until n) {
+            computeWeights(px[i], w, h, weights[i])
+        }
+
+        // Normalise weights per pixel so they sum to 1 (avoid divide-by-zero).
+        val totalAtPx = FloatArray(w * h)
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                totalAtPx[k] += weights[i][k]
+        for (k in 0 until w * h)
+            if (totalAtPx[k] < 1e-6f) totalAtPx[k] = 1e-6f
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                weights[i][k] /= totalAtPx[k]
+
+        // (Lightweight) edge-preserving smooth of the weights so we don't get blocky transitions.
+        for (i in 0 until n) boxBlur(weights[i], w, h, radius = 6)
+        // Renormalise after blur.
+        java.util.Arrays.fill(totalAtPx, 0f)
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                totalAtPx[k] += weights[i][k]
+        for (k in 0 until w * h)
+            if (totalAtPx[k] < 1e-6f) totalAtPx[k] = 1e-6f
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                weights[i][k] /= totalAtPx[k]
+
+        // Blend.
+        val out = IntArray(w * h)
+        for (k in 0 until w * h) {
+            var r = 0f; var g = 0f; var b = 0f
+            for (i in 0 until n) {
+                val p = px[i][k]
+                val wi = weights[i][k]
+                r += wi * ((p shr 16) and 0xFF)
+                g += wi * ((p shr 8) and 0xFF)
+                b += wi * (p and 0xFF)
+            }
+            val ri = r.toInt().coerceIn(0, 255)
+            val gi = g.toInt().coerceIn(0, 255)
+            val bi = b.toInt().coerceIn(0, 255)
+            out[k] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+        return out
+    }
+
+    private fun computeWeights(px: IntArray, w: Int, h: Int, out: FloatArray) {
+        // Pre-compute luminance + saturation per pixel.
+        val lum = FloatArray(w * h)
+        val sat = FloatArray(w * h)
+        for (k in 0 until w * h) {
+            val p = px[k]
+            val r = ((p shr 16) and 0xFF) / 255f
+            val g = ((p shr 8) and 0xFF) / 255f
+            val b = (p and 0xFF) / 255f
+            val L = 0.299f * r + 0.587f * g + 0.114f * b
+            lum[k] = L
+            val mean = (r + g + b) / 3f
+            sat[k] = kotlin.math.sqrt(((r - mean) * (r - mean) + (g - mean) * (g - mean) + (b - mean) * (b - mean)) / 3f)
+        }
+
+        // Contrast = |Laplacian(L)| (5-tap discrete).
+        val contrast = FloatArray(w * h)
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val c = row + x
+                val v = -4f * lum[c] + lum[c - 1] + lum[c + 1] + lum[c - w] + lum[c + w]
+                contrast[c] = abs(v)
+            }
+        }
+
+        // Well-exposedness = product of gaussian(channel; mu=0.5, sigma=0.2).
+        // Combine into final weight per pixel.
+        val sigma = 0.2f
+        val twoSigSq = 2f * sigma * sigma
+        for (k in 0 until w * h) {
+            val p = px[k]
+            val r = ((p shr 16) and 0xFF) / 255f
+            val g = ((p shr 8) and 0xFF) / 255f
+            val b = (p and 0xFF) / 255f
+            val we = exp(-((r - 0.5f) * (r - 0.5f)) / twoSigSq) *
+                     exp(-((g - 0.5f) * (g - 0.5f)) / twoSigSq) *
+                     exp(-((b - 0.5f) * (b - 0.5f)) / twoSigSq)
+            // raise contrast & sat to small power = 1, well-exposedness power = 1
+            val W = (contrast[k] + 1e-3f) * (sat[k] + 1e-3f) * (we + 1e-3f)
+            out[k] = W
+        }
+    }
+
+    // ---------- Focus stacking ----------
+
+    /**
+     * For each fused-per-focus image, compute a local "sharpness" map (squared Laplacian, smoothed)
+     * then per-pixel blend with weights proportional to the sharpness map.
+     */
+    private fun focusStack(fusedPerFocus: List<IntArray>, w: Int, h: Int): IntArray {
+        val n = fusedPerFocus.size
+        if (n == 1) return fusedPerFocus[0]
+
+        val sharp = Array(n) { FloatArray(w * h) }
+        for (i in 0 until n) {
+            sharpnessMap(fusedPerFocus[i], w, h, sharp[i])
+            boxBlur(sharp[i], w, h, radius = 8)   // soften so transitions don't show seams
+        }
+
+        // Normalise per pixel.
+        val total = FloatArray(w * h)
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                total[k] += sharp[i][k]
+        for (k in 0 until w * h)
+            if (total[k] < 1e-6f) total[k] = 1e-6f
+        for (i in 0 until n)
+            for (k in 0 until w * h)
+                sharp[i][k] /= total[k]
+
+        // Blend.
+        val out = IntArray(w * h)
+        for (k in 0 until w * h) {
+            var r = 0f; var g = 0f; var b = 0f
+            for (i in 0 until n) {
+                val p = fusedPerFocus[i][k]
+                val wi = sharp[i][k]
+                r += wi * ((p shr 16) and 0xFF)
+                g += wi * ((p shr 8) and 0xFF)
+                b += wi * (p and 0xFF)
+            }
+            val ri = r.toInt().coerceIn(0, 255)
+            val gi = g.toInt().coerceIn(0, 255)
+            val bi = b.toInt().coerceIn(0, 255)
+            out[k] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+        return out
+    }
+
+    private fun sharpnessMap(px: IntArray, w: Int, h: Int, out: FloatArray) {
+        // Squared Laplacian of luminance — classic focus measure.
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val c = row + x
+                val lc = lum(px[c])
+                val lL = lum(px[c - 1])
+                val lR = lum(px[c + 1])
+                val lU = lum(px[c - w])
+                val lD = lum(px[c + w])
+                val L = -4f * lc + lL + lR + lU + lD
+                out[c] = L * L
+            }
+        }
+    }
+
+    private fun lum(p: Int): Float {
+        val r = ((p shr 16) and 0xFF)
+        val g = ((p shr 8) and 0xFF)
+        val b = (p and 0xFF)
+        return 0.299f * r + 0.587f * g + 0.114f * b
+    }
+
+    // ---------- Utility ----------
+
+    private fun decodeScaled(jpeg: ByteArray, maxLongEdge: Int): Bitmap {
+        // First bounds pass.
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
+        var sample = 1
+        val long = max(opts.outWidth, opts.outHeight)
+        while (long / sample > maxLongEdge) sample *= 2
+        val opts2 = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts2)
+            ?: throw RuntimeException("Failed to decode JPEG")
+    }
+
+    /** In-place separable box blur (two passes, horizontal + vertical). */
+    private fun boxBlur(src: FloatArray, w: Int, h: Int, radius: Int) {
+        if (radius < 1) return
+        val tmp = FloatArray(src.size)
+        val winSize = (radius * 2 + 1).toFloat()
+
+        // Horizontal pass.
+        for (y in 0 until h) {
+            var sum = 0f
+            val row = y * w
+            // Init window
+            for (x in -radius..radius) sum += src[row + x.coerceIn(0, w - 1)]
+            for (x in 0 until w) {
+                tmp[row + x] = sum / winSize
+                val xAdd = (x + radius + 1).coerceAtMost(w - 1)
+                val xSub = (x - radius).coerceAtLeast(0)
+                sum += src[row + xAdd] - src[row + xSub]
+            }
+        }
+        // Vertical pass.
+        for (x in 0 until w) {
+            var sum = 0f
+            for (y in -radius..radius) sum += tmp[(y.coerceIn(0, h - 1)) * w + x]
+            for (y in 0 until h) {
+                src[y * w + x] = sum / winSize
+                val yAdd = (y + radius + 1).coerceAtMost(h - 1)
+                val ySub = (y - radius).coerceAtLeast(0)
+                sum += tmp[yAdd * w + x] - tmp[ySub * w + x]
+            }
+        }
+    }
+}

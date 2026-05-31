@@ -1,0 +1,52 @@
+package com.fivelidz.compositecamera.motion
+
+import android.graphics.Bitmap
+
+/**
+ * A bounded ring of recent frames keyed by their capture timestamp (nanoseconds).
+ *
+ * Memory is the limiting factor — 5 s @ 30 fps @ 720×1280 ARGB = ~570 MB if we held full bitmaps,
+ * so we hold downsampled copies for lookup and recycle older ones aggressively.
+ *
+ * frameAt(ts) returns the buffered frame whose timestamp is closest to ts (or null if no frame
+ * is older than ts yet — happens for the first delay-seconds of playback).
+ */
+class FrameRingBuffer(
+    private val maxSeconds: Float,
+    private val targetFps: Float,
+) {
+    private data class Entry(val ts: Long, val bmp: Bitmap)
+    private val entries = ArrayDeque<Entry>()
+    private val maxNanos = (maxSeconds * 1e9f).toLong()
+
+    @Synchronized
+    fun push(bmp: Bitmap, ts: Long) {
+        entries.addLast(Entry(ts, bmp))
+        // Drop anything older than maxSeconds.
+        while (entries.isNotEmpty() && ts - entries.first().ts > maxNanos) {
+            val e = entries.removeFirst()
+            if (!e.bmp.isRecycled) e.bmp.recycle()
+        }
+    }
+
+    /**
+     * Returns the entry closest to but not after [target] timestamp, or null if we have nothing
+     * older than that (warm-up period).
+     */
+    @Synchronized
+    fun frameAt(target: Long): Bitmap? {
+        if (entries.isEmpty()) return null
+        // Find the latest entry with ts <= target.
+        var best: Entry? = null
+        for (e in entries) {
+            if (e.ts <= target) best = e else break
+        }
+        return best?.bmp
+    }
+
+    @Synchronized
+    fun clear() {
+        for (e in entries) if (!e.bmp.isRecycled) e.bmp.recycle()
+        entries.clear()
+    }
+}
